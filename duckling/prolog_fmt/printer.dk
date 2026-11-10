@@ -1,0 +1,635 @@
+#{
+    Layout of a parsed clause.
+
+    Only whitespace is ever changed: every code token is printed exactly once, in the original
+    order. Comments are placed at goal boundaries. A comment in a position the printer cannot
+    handle makes `printClause` fail, so the caller can fall back to the token-level formatter.
+
+    Output goes to `w.outs[0]`, flat layouts are measured in `w.outs[1]`.
+#}
+import core.containers.*;
+import prolog_fmt.unicode.*;
+import prolog_fmt.lexer.*;
+import prolog_fmt.ops.*;
+import prolog_fmt.out.*;
+import prolog_fmt.world.*;
+import prolog_fmt.parser.*;
+
+# ------------------------------------------------------------------ helpers ---
+
+fun nt(w: ref World, n: i64) -> i64 = w.nodes.at(n).t;
+fun na(w: ref World, n: i64) -> i64 = w.nodes.at(n).a;
+fun nb(w: ref World, n: i64) -> i64 = w.nodes.at(n).b;
+fun nc(w: ref World, n: i64) -> i64 = w.nodes.at(n).c;
+fun nkids(w: ref World, n: i64) -> i64 = w.nodes.at(n).klen;
+
+fun oTok(w: ref World, k: i64, i: i64) -> () = {
+    let t: Tok = w.code.at(i);
+    w.outs.at(k).tok(&w.src, &t);
+}
+
+fun oTokTight(w: ref World, k: i64, i: i64) -> () = {
+    let t: Tok = w.code.at(i);
+    w.outs.at(k).tokTight(&w.src, &t);
+}
+
+fun oSp(w: ref World, k: i64) -> () = {
+    w.outs.at(k).sp();
+}
+
+fun tok(w: ref World, i: i64) -> () = oTok(w, 0, i);
+
+fun sp(w: ref World) -> () = oSp(w, 0);
+
+fun nl(w: ref World, ind: i64) -> () = {
+    w.outs.at(0).nl(ind);
+}
+
+fun padTo(w: ref World, c: i64) -> () = {
+    w.outs.at(0).padTo(c);
+}
+
+fun col(w: ref World) -> i64 = w.outs.at(0).col;
+
+fun emitComment(w: ref World, ci: i64) -> () = {
+    let t: Tok = w.comments.at(ci).tok;
+    w.outs.at(0).comment(&w.src, &t);
+}
+
+# ----------------------------------------------------------- classification ---
+
+fun opIs(w: ref World, n: i64, lit: str) -> bool = nt(w, n) == N_INFIX and textAt(w, na(w, n), lit);
+
+fun isConj(w: ref World, n: i64) -> bool = nt(w, n) == N_INFIX and kindAt(w, na(w, n)) == COMMA;
+
+fun isDisj(w: ref World, n: i64) -> bool = opIs(w, n, ";") or opIs(w, n, "|");
+
+fun isIte(w: ref World, n: i64) -> bool = opIs(w, n, "->") or opIs(w, n, "*->");
+
+fun isControl(w: ref World, n: i64) -> bool = isDisj(w, n) or isIte(w, n);
+
+#{
+    Does laying out this goal require several lines?
+#}
+fun forcesBreak(w: ref World, n: i64) -> bool = {
+    if (isControl(w, n)) return true;
+    if (isConj(w, n)) return forcesBreak(w, nb(w, n)) or forcesBreak(w, nc(w, n));
+    if (nt(w, n) == N_PAREN) {
+        let inner = na(w, n);
+        return isControl(w, inner) or (isConj(w, inner) and forcesBreak(w, inner));
+    }
+    return false;
+}
+
+fun isAlnumName(w: ref World, i: i64) -> bool = {
+    let t: Tok = w.code.at(i);
+    return isAlpha(firstCp(&w.src, t.start, t.end));
+}
+
+fun infixSpaced(w: ref World, op: i64, r: i64) -> bool = {
+    if (kindAt(w, op) == BAR or isAlnumName(w, op)) return true;
+    if (textAt(w, op, ":-") or textAt(w, op, "-->") or textAt(w, op, "=>") or textAt(w, op, "->")
+            or textAt(w, op, "*->") or textAt(w, op, ";") or textAt(w, op, ":=")) return true;
+    let d = lookupOp(w, INFIX_OP, op);
+    if (d >= 0 and w.ops.prec(d) >= 700) return true;
+    if (punctAt(w, startOf(w, r), 40)) return true;
+    if (wsBefore(w, op)) return true;
+    return op + 1 < codeLen(w) and wsBefore(w, op + 1);
+}
+
+fun prefixSpaced(w: ref World, op: i64, arg: i64) -> bool = {
+    if (isAlnumName(w, op) or textAt(w, op, "\\+") or textAt(w, op, ":-") or textAt(w, op, "?-")) return true;
+    let first = startOf(w, arg);
+    if (punctAt(w, first, 40) or kindAt(w, first) == NUM) return true;
+    return wsBefore(w, first);
+}
+
+fun isAtomic(w: ref World, n: i64) -> bool = {
+    let t = nt(w, n);
+    return t == N_LEAF or t == N_NEG or t == N_EMPTY;
+}
+
+# --------------------------------------------------------------- flat layout ---
+
+fun flatOut(w: ref World, n: i64, k: i64) -> () = {
+    let t = nt(w, n);
+    if (t == N_LEAF) oTok(w, k, na(w, n));
+    else if (t == N_NEG or t == N_EMPTY) {
+        oTok(w, k, na(w, n));
+        oTok(w, k, nb(w, n));
+    } else if (t == N_COMPOUND) {
+        oTok(w, k, na(w, n));
+        oTokTight(w, k, na(w, n) + 1);
+        var j: i64 = 0;
+        while (j < nkids(w, n)) {
+            if (j > 0) {
+                oTok(w, k, endOf(w, kid(w, n, j - 1)) + 1);
+                oSp(w, k);
+            }
+            flatOut(w, kid(w, n, j), k);
+            j = j + 1;
+        }
+        oTok(w, k, endOf(w, n));
+    } else if (t == N_LIST) {
+        oTok(w, k, startOf(w, n));
+        var li: i64 = 0;
+        while (li < nkids(w, n)) {
+            if (li > 0) {
+                oTok(w, k, endOf(w, kid(w, n, li - 1)) + 1);
+                oSp(w, k);
+            }
+            flatOut(w, kid(w, n, li), k);
+            li = li + 1;
+        }
+        if (nb(w, n) >= 0) {
+            oSp(w, k);
+            oTok(w, k, endOf(w, kid(w, n, nkids(w, n) - 1)) + 1);
+            oSp(w, k);
+            flatOut(w, nb(w, n), k);
+        }
+        oTok(w, k, endOf(w, n));
+    } else if (t == N_CURLY or t == N_PAREN) {
+        oTok(w, k, startOf(w, n));
+        flatOut(w, na(w, n), k);
+        oTok(w, k, endOf(w, n));
+    } else if (t == N_INFIX) {
+        let op = na(w, n);
+        flatOut(w, nb(w, n), k);
+        if (kindAt(w, op) == COMMA) {
+            oTok(w, k, op);
+            oSp(w, k);
+        } else if (infixSpaced(w, op, nc(w, n))) {
+            oSp(w, k);
+            oTok(w, k, op);
+            oSp(w, k);
+        } else {
+            oTok(w, k, op);
+        }
+        flatOut(w, nc(w, n), k);
+    } else if (t == N_PREFIX) {
+        oTok(w, k, na(w, n));
+        if (prefixSpaced(w, na(w, n), nb(w, n))) oSp(w, k);
+        flatOut(w, nb(w, n), k);
+    } else {
+        flatOut(w, nb(w, n), k);
+        oTok(w, k, na(w, n));
+    }
+}
+
+fun flatLen(w: ref World, n: i64) -> i64 = {
+    w.outs.at(1).reset();
+    flatOut(w, n, 1);
+    return cpCount(&w.outs.at(1).s, 0, w.outs.at(1).s.length());
+}
+
+fun fits(w: ref World, n: i64, reserve: i64) -> bool = col(w) + flatLen(w, n) + reserve <= w.width;
+
+#{
+    Flattens a right-nested chain of `,` (or of `;` / `|` when `disj`) into its operands, with
+    the separator token before each operand (-1 for the first).
+#}
+fun chainOf(w: ref World, n: i64, disj: bool, items: ref List[i64], seps: ref List[i64]) -> () = {
+    var cur = n;
+    var sep: i64 = -1;
+    var going = true;
+    while (going) {
+        var more = isConj(w, cur);
+        if (disj) more = isDisj(w, cur);
+        if (more) {
+            items.push(nb(w, cur));
+            seps.push(sep);
+            sep = na(w, cur);
+            cur = nc(w, cur);
+        } else {
+            items.push(cur);
+            seps.push(sep);
+            going = false;
+        }
+    }
+}
+
+# ----------------------------------------------------------------- comments ---
+
+#{
+    Comments lying between code token `lo` and code token `hi` (exclusive of `lo`, inclusive of
+    `hi`), split into those on the line of `lo` (trailing) and the rest (leading). Marks them as
+    used.
+#}
+fun takeGap(w: ref World, lo: i64, hi: i64, tr: ref List[i64], ld: ref List[i64]) -> () = {
+    var k: i64 = 0;
+    while (k < w.comments.length()) {
+        let c: Comment = w.comments.at(k);
+        if (not w.used.at(k) and c.gap > lo and c.gap <= hi) {
+            w.used.at(k) = true;
+            if (c.same_line and ld.length() == 0) tr.push(k);
+            else ld.push(k);
+        }
+        k = k + 1;
+    }
+}
+
+fun hasComments(w: ref World, lo: i64, hi: i64) -> bool = {
+    var k: i64 = 0;
+    while (k < w.comments.length()) {
+        let g = w.comments.at(k).gap;
+        if (g > lo and g <= hi) return true;
+        k = k + 1;
+    }
+    return false;
+}
+
+fun emitTrailing(w: ref World, cs: ref List[i64]) -> () = {
+    var i: i64 = 0;
+    while (i < cs.length()) {
+        sp(w);
+        emitComment(w, cs.at(i));
+        i = i + 1;
+    }
+}
+
+#{
+    Comments on their own lines, each followed by a newline at `ind`.
+#}
+fun emitLeading(w: ref World, cs: ref List[i64], ind: i64) -> () = {
+    var i: i64 = 0;
+    while (i < cs.length()) {
+        emitComment(w, cs.at(i));
+        nl(w, ind);
+        i = i + 1;
+    }
+}
+
+#{
+    Comments that must go on their own lines before the closing of a construct, each preceded
+    by a newline at `ind`.
+#}
+fun emitBefore(w: ref World, cs: ref List[i64], ind: i64) -> () = {
+    var i: i64 = 0;
+    while (i < cs.length()) {
+        nl(w, ind);
+        emitComment(w, cs.at(i));
+        i = i + 1;
+    }
+}
+
+fun appendAll(dst: ref List[i64], src: ref List[i64]) -> () = {
+    var i: i64 = 0;
+    while (i < src.length()) {
+        dst.push(src.at(i));
+        i = i + 1;
+    }
+}
+
+# ------------------------------------------------------------------- clauses ---
+
+#{
+    Lays out the clause rooted at `n` into `w.outs[0]`. Returns false when some comment could
+    not be placed.
+#}
+fun printClause(w: ref World, n: i64) -> bool = {
+    let len = codeLen(w);
+    let has_end = kindAt(w, len - 1) == END;
+    let multiline = w.code.at(endOf(w, n)).end_line > w.code.at(startOf(w, n)).line;
+    let inner = hasComments(w, startOf(w, n), endOf(w, n));
+    var tr: List[i64];
+    var ld: List[i64];
+    if (nt(w, n) == N_INFIX and (opIs(w, n, ":-") or opIs(w, n, "-->") or opIs(w, n, "=>"))) {
+        let op = na(w, n);
+        let l = nb(w, n);
+        let r = nc(w, n);
+        let force = inner or multiline or forcesBreak(w, r);
+        if (not force and fits(w, n, 1)) flatOut(w, n, 0);
+        else {
+            termLayout(w, l, 0, 3);
+            sp(w);
+            tok(w, op);
+            takeGap(w, endOf(w, l), startOf(w, r), &tr, &ld);
+            emitTrailing(w, &tr);
+            nl(w, INDENT);
+            emitLeading(w, &ld, INDENT);
+            goalLayout(w, r, INDENT, 1);
+        }
+    } else if (nt(w, n) == N_PREFIX and (textAt(w, na(w, n), ":-") or textAt(w, na(w, n), "?-"))) {
+        let pop = na(w, n);
+        let parg = nb(w, n);
+        if (not inner and not forcesBreak(w, parg) and fits(w, n, 1)) flatOut(w, n, 0);
+        else {
+            tok(w, pop);
+            takeGap(w, pop, startOf(w, parg), &tr, &ld);
+            emitTrailing(w, &tr);
+            nl(w, INDENT);
+            emitLeading(w, &ld, INDENT);
+            goalLayout(w, parg, INDENT, 1);
+        }
+    } else {
+        termLayout(w, n, 0, 1);
+    }
+    var etr: List[i64];
+    var eld: List[i64];
+    takeGap(w, endOf(w, n), len, &etr, &eld);
+    if (has_end) tok(w, len - 1);
+    emitTrailing(w, &etr);
+    var i: i64 = 0;
+    while (i < eld.length()) {
+        nl(w, 0);
+        emitComment(w, eld.at(i));
+        i = i + 1;
+    }
+    var u: i64 = 0;
+    while (u < w.used.length()) {
+        if (not w.used.at(u)) return false;
+        u = u + 1;
+    }
+    w.outs.at(0).finish();
+    return true;
+}
+
+# --------------------------------------------------------------------- goals ---
+
+#{
+    Lays out a goal, the output is positioned at column `ind`.
+#}
+fun goalLayout(w: ref World, n: i64, ind: i64, reserve: i64) -> () = {
+    if (isConj(w, n)) conjLayout(w, n, ind, reserve);
+    else if (isControl(w, n)) {
+        var sep_col = ind - INDENT;
+        if (sep_col < 0) sep_col = 0;
+        alternatives(w, n, sep_col, ind, -1, reserve);
+    } else if (nt(w, n) == N_PAREN) {
+        let inner = na(w, n);
+        let is_block = isControl(w, inner)
+            or (isConj(w, inner) and (hasComments(w, startOf(w, n), endOf(w, n)) or not fits(w, n, reserve)));
+        if (is_block) blockLayout(w, n, reserve);
+        else termLayout(w, n, ind, reserve);
+    } else {
+        termLayout(w, n, ind, reserve);
+    }
+}
+
+fun conjLayout(w: ref World, n: i64, ind: i64, reserve: i64) -> () = {
+    var items: List[i64];
+    var seps: List[i64];
+    chainOf(w, n, false, &items, &seps);
+    let last = items.length() - 1;
+    var k: i64 = 0;
+    while (k <= last) {
+        let g = items.at(k);
+        let sep = seps.at(k);
+        if (sep >= 0) {
+            let prev = items.at(k - 1);
+            tok(w, sep);
+            var tr: List[i64];
+            var ld: List[i64];
+            takeGap(w, endOf(w, prev), startOf(w, g), &tr, &ld);
+            var next_line = w.code.at(startOf(w, g)).line;
+            if (ld.length() > 0) next_line = w.comments.at(ld.at(0)).tok.line;
+            var after_sep = w.code.at(sep).end_line;
+            if (tr.length() > 0) after_sep = w.comments.at(tr.at(tr.length() - 1)).tok.end_line;
+            emitTrailing(w, &tr);
+            nl(w, ind);
+            if (next_line > after_sep + 1) nl(w, ind);
+            emitLeading(w, &ld, ind);
+        }
+        var r: i64 = 1;
+        if (k == last) r = reserve;
+        goalLayout(w, g, ind, r);
+        k = k + 1;
+    }
+}
+
+#{
+    SWI-style block:
+        (   Cond
+        ->  Then
+        ;   Else
+        )
+#}
+fun blockLayout(w: ref World, n: i64, reserve: i64) -> () = {
+    let inner = na(w, n);
+    let base = col(w);
+    tok(w, startOf(w, n));
+    padTo(w, base + INDENT);
+    alternatives(w, inner, base, base + INDENT, startOf(w, n), 0);
+    var tr: List[i64];
+    var ld: List[i64];
+    takeGap(w, endOf(w, inner), endOf(w, n), &tr, &ld);
+    emitTrailing(w, &tr);
+    emitBefore(w, &ld, base + INDENT);
+    nl(w, base);
+    tok(w, endOf(w, n));
+}
+
+#{
+    Disjunction / if-then-else layout with separators at `sep_col` and goals at `goal_col`. The
+    output is positioned at `goal_col` on entry. `open` is the token before the first
+    alternative, or -1.
+#}
+fun alternatives(w: ref World, n: i64, sep_col: i64, goal_col: i64, open: i64, reserve: i64) -> () = {
+    var items: List[i64];
+    var seps: List[i64];
+    chainOf(w, n, true, &items, &seps);
+    let last = items.length() - 1;
+    var k: i64 = 0;
+    while (k <= last) {
+        let alt = items.at(k);
+        let sep = seps.at(k);
+        var before = open;
+        if (sep >= 0) {
+            var tr: List[i64];
+            var ld: List[i64];
+            takeGap(w, endOf(w, items.at(k - 1)), sep, &tr, &ld);
+            emitTrailing(w, &tr);
+            emitBefore(w, &ld, goal_col);
+            nl(w, sep_col);
+            tok(w, sep);
+            padTo(w, goal_col);
+            before = sep;
+        }
+        if (before >= 0) {
+            var btr: List[i64];
+            var bld: List[i64];
+            takeGap(w, before, startOf(w, alt), &btr, &bld);
+            appendAll(&btr, &bld);
+            emitLeading(w, &btr, goal_col);
+        }
+        var r: i64 = 0;
+        if (k == last) r = reserve;
+        if (isIte(w, alt)) {
+            let c = nb(w, alt);
+            let t = nc(w, alt);
+            let op = na(w, alt);
+            goalLayout(w, c, goal_col, 0);
+            var ctr: List[i64];
+            var cld: List[i64];
+            takeGap(w, endOf(w, c), op, &ctr, &cld);
+            emitTrailing(w, &ctr);
+            emitBefore(w, &cld, goal_col);
+            nl(w, sep_col);
+            tok(w, op);
+            padTo(w, goal_col);
+            var ttr: List[i64];
+            var tld: List[i64];
+            takeGap(w, op, startOf(w, t), &ttr, &tld);
+            appendAll(&ttr, &tld);
+            emitLeading(w, &ttr, goal_col);
+            goalLayout(w, t, goal_col, r);
+        } else {
+            goalLayout(w, alt, goal_col, r);
+        }
+        k = k + 1;
+    }
+}
+
+# --------------------------------------------------------------------- terms ---
+
+#{
+    Lays out a term, breaking it over several lines if it does not fit. Continuation lines are
+    indented relative to `ind`.
+#}
+fun termLayout(w: ref World, n: i64, ind: i64, reserve: i64) -> () = {
+    if (fits(w, n, reserve)) {
+        flatOut(w, n, 0);
+        return;
+    }
+    let inner_ind = ind + INDENT;
+    let t = nt(w, n);
+    if (t == N_COMPOUND) {
+        tok(w, na(w, n));
+        oTokTight(w, 0, na(w, n) + 1);
+        if (hugLast(w, n, ind, reserve)) {
+            tok(w, endOf(w, n));
+            return;
+        }
+        var j: i64 = 0;
+        while (j < nkids(w, n)) {
+            if (j > 0) tok(w, endOf(w, kid(w, n, j - 1)) + 1);
+            nl(w, inner_ind);
+            argLayout(w, kid(w, n, j), inner_ind, 1);
+            j = j + 1;
+        }
+        nl(w, ind);
+        tok(w, endOf(w, n));
+    } else if (t == N_LIST) {
+        tok(w, startOf(w, n));
+        nl(w, inner_ind);
+        var fill = true;
+        var fi: i64 = 0;
+        while (fi < nkids(w, n)) {
+            if (not isAtomic(w, kid(w, n, fi))) fill = false;
+            fi = fi + 1;
+        }
+        var li: i64 = 0;
+        while (li < nkids(w, n)) {
+            let item = kid(w, n, li);
+            if (li > 0) {
+                tok(w, endOf(w, kid(w, n, li - 1)) + 1);
+                if (fill and fits(w, item, 2)) sp(w);
+                else nl(w, inner_ind);
+            }
+            argLayout(w, item, inner_ind, 1);
+            li = li + 1;
+        }
+        if (nb(w, n) >= 0) {
+            sp(w);
+            tok(w, endOf(w, kid(w, n, nkids(w, n) - 1)) + 1);
+            sp(w);
+            argLayout(w, nb(w, n), inner_ind, 0);
+        }
+        nl(w, ind);
+        tok(w, endOf(w, n));
+    } else if (t == N_CURLY) {
+        tok(w, startOf(w, n));
+        nl(w, inner_ind);
+        goalLayout(w, na(w, n), inner_ind, 0);
+        nl(w, ind);
+        tok(w, endOf(w, n));
+    } else if (t == N_PAREN) {
+        let inner = na(w, n);
+        if (isConj(w, inner) or isControl(w, inner)) blockLayout(w, n, reserve);
+        else {
+            tok(w, startOf(w, n));
+            termLayout(w, inner, ind, reserve + 1);
+            tok(w, endOf(w, n));
+        }
+    } else if (t == N_INFIX) {
+        let op = na(w, n);
+        let l = nb(w, n);
+        let r = nc(w, n);
+        if (kindAt(w, op) == COMMA) {
+            termLayout(w, l, ind, 1);
+            tok(w, op);
+            nl(w, ind);
+            termLayout(w, r, ind, reserve);
+            return;
+        }
+        let spaced = infixSpaced(w, op, r);
+        let opt: Tok = w.code.at(op);
+        termLayout(w, l, ind, cpCount(&w.src, opt.start, opt.end) + 1);
+        if (spaced) sp(w);
+        tok(w, op);
+        if (spaced) sp(w);
+        if (fits(w, r, reserve)) flatOut(w, r, 0);
+        else {
+            nl(w, inner_ind);
+            termLayout(w, r, inner_ind, reserve);
+        }
+    } else if (t == N_PREFIX) {
+        tok(w, na(w, n));
+        if (prefixSpaced(w, na(w, n), nb(w, n))) sp(w);
+        termLayout(w, nb(w, n), ind, reserve);
+    } else if (t == N_POSTFIX) {
+        termLayout(w, nb(w, n), ind, reserve + 1);
+        tok(w, na(w, n));
+    } else {
+        flatOut(w, n, 0);
+    }
+}
+
+#{
+    `foo(A, B, [` ... `])`: keeps all but the last argument on the opening line and lets the
+    last one (a list or compound) break.
+#}
+fun hugLast(w: ref World, n: i64, ind: i64, reserve: i64) -> bool = {
+    let cnt = nkids(w, n);
+    let last = kid(w, n, cnt - 1);
+    let lt = nt(w, last);
+    if (lt != N_LIST and lt != N_COMPOUND) return false;
+    var head: i64 = 0;
+    var j: i64 = 0;
+    while (j < cnt - 1) {
+        head = head + flatLen(w, kid(w, n, j)) + 2;
+        j = j + 1;
+    }
+    # The opening of the last argument must fit too.
+    var open: i64 = 1;
+    if (lt == N_COMPOUND) {
+        let nm: Tok = w.code.at(na(w, last));
+        open = cpCount(&w.src, nm.start, nm.end) + 1;
+    }
+    if (col(w) + head + open > w.width) return false;
+    var i: i64 = 0;
+    while (i < cnt - 1) {
+        let a = kid(w, n, i);
+        flatOut(w, a, 0);
+        tok(w, endOf(w, a) + 1);
+        sp(w);
+        i = i + 1;
+    }
+    termLayout(w, last, ind, reserve + 1);
+    return true;
+}
+
+#{
+    An argument of a compound term or a list element: a parenthesised conjunction (a meta-call
+    goal) gets goal layout.
+#}
+fun argLayout(w: ref World, n: i64, ind: i64, reserve: i64) -> () = {
+    if (nt(w, n) == N_PAREN) {
+        let inner = na(w, n);
+        if ((isConj(w, inner) or isControl(w, inner)) and not fits(w, n, reserve)) {
+            blockLayout(w, n, reserve);
+            return;
+        }
+    }
+    termLayout(w, n, ind, reserve);
+}

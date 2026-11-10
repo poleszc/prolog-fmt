@@ -1,0 +1,131 @@
+#{
+    Output buffer that tracks the column and inserts a space between two tokens whenever gluing
+    them together would change how they tokenize.
+#}
+import core.containers.*;
+import prolog_fmt.unicode.*;
+import prolog_fmt.lexer.*;
+
+#{
+    Would a token of kind `prev` ending with `a` immediately followed by a token of kind `next`
+    starting with `b` tokenize differently?
+#}
+fun needsSpace(prev: i64, a: i64, next: i64, b: i64, tight: bool) -> bool = {
+    if (b < 0) return false;
+    # `foo (` must not turn into the functional notation `foo(`.
+    if (next == PUNCT and b == 40 and not tight and (prev == ATOM or prev == QATOM)) return true;
+    if (isWordChar(a) and isWordChar(b)) return true;
+    if (isSymbolChar(a) and isSymbolChar(b)) return true;
+    if (prev == NUM and (b == 39 or (b == 46 and next != END))) return true;
+    if (a == b and (a == 39 or a == 34 or a == 96)) return true;
+    return false;
+}
+
+class Out {
+    s: String;
+    col: i64 = 0;
+    # Kind and last code point of the last token, -1 when nothing was written yet.
+    last_kind: i64 = -1;
+    last_char: i64 = -1;
+    line_start: bool = true;
+    must_break: bool = false;
+    cur_ind: i64 = 0;
+
+    fun reset() -> () = {
+        s.clear();
+        col        = 0;
+        last_kind  = -1;
+        last_char  = -1;
+        line_start = true;
+        must_break = false;
+        cur_ind    = 0;
+    }
+
+    fun rawRange(src: ref String, a: i64, b: i64) -> () = {
+        var i = a;
+        while (i < b) {
+            let c: char = src.at(i);
+            s.append(c);
+            let v = c as i64;
+            if (v == 10) col = 0;
+            else if (not isCont(v)) col = col + 1;
+            i = i + 1;
+        }
+    }
+
+    fun space() -> () = {
+        s.append(' ');
+        col = col + 1;
+    }
+
+    fun endsWithSpace() -> bool = {
+        if (s.length() == 0) return false;
+        return byteAt(&s, s.length() - 1) == 32;
+    }
+
+    fun put(src: ref String, kind: i64, a: i64, b: i64, tight: bool) -> () = {
+        if (must_break) nl(cur_ind);
+        if (not line_start and not endsWithSpace() and last_kind >= 0) {
+            if (needsSpace(last_kind, last_char, kind, firstCp(src, a, b), tight)) space();
+        }
+        rawRange(src, a, b);
+        line_start = false;
+        last_kind  = kind;
+        last_char  = 32;
+        if (a < b) last_char = lastCp(src, a, b);
+    }
+
+    fun tok(src: ref String, t: ref Tok) -> () = {
+        put(src, t.kind, t.start, t.end, false);
+    }
+
+    #{
+        Emits `t` with no space before it even if it is `(` after an atom (used for the `(` of a
+        compound term).
+    #}
+    fun tokTight(src: ref String, t: ref Tok) -> () = {
+        put(src, t.kind, t.start, t.end, true);
+    }
+
+    fun sp() -> () = {
+        if (not line_start and not must_break and not endsWithSpace()) space();
+    }
+
+    fun nl(ind: i64) -> () = {
+        while (s.length() > 0 and byteAt(&s, s.length() - 1) == 32) s.len = s.len - 1;
+        s.append('\n');
+        var i: i64 = 0;
+        while (i < ind) {
+            s.append(' ');
+            i = i + 1;
+        }
+        col        = ind;
+        line_start = true;
+        must_break = false;
+        cur_ind    = ind;
+    }
+
+    fun padTo(c: i64) -> () = {
+        while (col < c) space();
+    }
+
+    fun comment(src: ref String, t: ref Tok) -> () = {
+        if (must_break) nl(cur_ind);
+        if (t.kind == LCOMMENT) {
+            rawRange(src, t.start, trimEndPos(src, t.start, t.end));
+            must_break = true;
+        } else {
+            rawRange(src, t.start, t.end);
+        }
+        line_start = false;
+        last_kind  = t.kind;
+        last_char  = 32;
+    }
+
+    #{
+        Removes trailing whitespace, giving the final text.
+    #}
+    fun finish() -> () = {
+        s.len = trimEndPos(&s, 0, s.length());
+    }
+}

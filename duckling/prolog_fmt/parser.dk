@@ -1,0 +1,284 @@
+#{
+    Lenient operator-precedence parser. It works on the code tokens of one clause (comments
+    removed) and builds a tree whose nodes refer back to token indices, so the printer can
+    reproduce every token exactly.
+#}
+import core.containers.*;
+import prolog_fmt.unicode.*;
+import prolog_fmt.lexer.*;
+import prolog_fmt.ops.*;
+import prolog_fmt.world.*;
+
+fun codeLen(w: ref World) -> i64 = w.code.length();
+
+fun kindAt(w: ref World, i: i64) -> i64 = {
+    if (i < 0 or i >= w.code.length()) return -1;
+    return w.code.at(i).kind;
+}
+
+fun punctAt(w: ref World, i: i64, c: i64) -> bool = {
+    if (kindAt(w, i) != PUNCT) return false;
+    return byteAt(&w.src, w.code.at(i).start) == c;
+}
+
+fun textAt(w: ref World, i: i64, lit: str) -> bool = {
+    let t: Tok = w.code.at(i);
+    return rangeIs(&w.src, t.start, t.end, lit);
+}
+
+fun wsBefore(w: ref World, i: i64) -> bool = w.code.at(i).ws_before;
+
+fun newNode(w: ref World, t: i64, a: i64, b: i64, c: i64, start: i64, end: i64) -> i64 = {
+    var n: Node;
+    n.t     = t;
+    n.a     = a;
+    n.b     = b;
+    n.c     = c;
+    n.start = start;
+    n.end   = end;
+    n.koff  = w.kids.length();
+    n.klen  = 0;
+    w.nodes.push(n);
+    return w.nodes.length() - 1;
+}
+
+fun setKids(w: ref World, n: i64, items: ref List[i64]) -> () = {
+    w.nodes.at(n).koff = w.kids.length();
+    w.nodes.at(n).klen = items.length();
+    var i: i64 = 0;
+    while (i < items.length()) {
+        w.kids.push(items.at(i));
+        i = i + 1;
+    }
+}
+
+fun kid(w: ref World, n: i64, k: i64) -> i64 = w.kids.at(w.nodes.at(n).koff + k);
+
+fun startOf(w: ref World, n: i64) -> i64 = w.nodes.at(n).start;
+
+fun endOf(w: ref World, n: i64) -> i64 = w.nodes.at(n).end;
+
+#{
+    Operator lookup by the name of code token `i`.
+#}
+fun lookupOp(w: ref World, cls: i64, i: i64) -> i64 = {
+    let t: Tok = w.code.at(i);
+    return w.ops.lookup(cls, &w.src, t.start, t.end);
+}
+
+#{
+    Does token `i` close the current term?
+#}
+fun isTermEnd(w: ref World, i: i64) -> bool = {
+    let k = kindAt(w, i);
+    return k == END or k == COMMA or k == BAR or punctAt(w, i, 41) or punctAt(w, i, 93) or punctAt(w, i, 125);
+}
+
+#{
+    Infix operator at token `i` encoded as `priority * 10 + type`, or -1. Inside argument lists
+    (`arg`) `,` and `|` are separators.
+#}
+fun infixOf(w: ref World, i: i64, arg: bool) -> i64 = {
+    let k = kindAt(w, i);
+    if (k == COMMA and not arg) return 1000 * 10 + XFY;
+    if (k == BAR and not arg) return 1100 * 10 + XFY;
+    if (k == ATOM) {
+        let d = lookupOp(w, INFIX_OP, i);
+        if (d >= 0) return w.ops.prec(d) * 10 + w.ops.assoc(d);
+    }
+    return -1;
+}
+
+#{
+    Parses a whole clause: a term followed by an end token or end of input. Returns the root node
+    or -1.
+#}
+fun parseClause(w: ref World) -> i64 = {
+    w.pos  = 0;
+    w.fail = false;
+    let n = parseExpr(w, 1200, false);
+    if (w.fail) return -1;
+    let len = codeLen(w);
+    if (w.pos == len) return n;
+    if (kindAt(w, w.pos) == END and w.pos + 1 == len) return n;
+    return -1;
+}
+
+fun parseExpr(w: ref World, max: i64, arg: bool) -> i64 = {
+    var left = primary(w, max, arg);
+    if (w.fail) return -1;
+    var lp = w.prec;
+    var going = true;
+    while (going and w.pos < codeLen(w)) {
+        let i = w.pos;
+        var handled = false;
+        let inf = infixOf(w, i, arg);
+        if (inf >= 0) {
+            let p = inf / 10;
+            let a = inf % 10;
+            var lmax = p - 1;
+            var rmax = p - 1;
+            if (a == XFY) rmax = p;
+            if (a == YFX) lmax = p;
+            if (p <= max and lp <= lmax) {
+                w.pos = w.pos + 1;
+                let r = parseExpr(w, rmax, arg);
+                if (w.fail) return -1;
+                left    = newNode(w, N_INFIX, i, left, r, startOf(w, left), endOf(w, r));
+                lp      = p;
+                handled = true;
+            }
+        }
+        if (not handled and kindAt(w, i) == ATOM) {
+            let d = lookupOp(w, POSTFIX_OP, i);
+            if (d >= 0) {
+                let pp = w.ops.prec(d);
+                var amax = pp - 1;
+                if (w.ops.assoc(d) == YF) amax = pp;
+                if (pp <= max and lp <= amax) {
+                    w.pos   = w.pos + 1;
+                    left    = newNode(w, N_POSTFIX, i, left, -1, startOf(w, left), i);
+                    lp      = pp;
+                    handled = true;
+                }
+            }
+        }
+        if (not handled) going = false;
+    }
+    w.prec = lp;
+    return left;
+}
+
+fun leaf(w: ref World, i: i64) -> i64 = {
+    w.pos  = i + 1;
+    w.prec = 0;
+    return newNode(w, N_LEAF, i, -1, -1, i, i);
+}
+
+#{
+    Consumes the punctuation `c` if it is next and returns its index, otherwise returns -1
+    without consuming anything.
+#}
+fun tryPunct(w: ref World, c: i64) -> i64 = {
+    if (punctAt(w, w.pos, c)) {
+        w.pos = w.pos + 1;
+        return w.pos - 1;
+    }
+    return -1;
+}
+
+fun failed(w: ref World) -> i64 = {
+    w.fail = true;
+    return -1;
+}
+
+fun primary(w: ref World, max: i64, arg: bool) -> i64 = {
+    let i = w.pos;
+    if (i >= codeLen(w)) return failed(w);
+    let k = kindAt(w, i);
+    let functional = punctAt(w, i + 1, 40) and not wsBefore(w, i + 1);
+    if (k == VAR or k == NUM or k == STR or k == BACKQ) return leaf(w, i);
+    if ((k == QATOM or k == ATOM) and functional) {
+        w.pos = i + 2;
+        var args: List[i64];
+        var more = true;
+        while (more) {
+            let a = parseExpr(w, 1200, true);
+            if (w.fail) return -1;
+            args.push(a);
+            if (kindAt(w, w.pos) == COMMA) w.pos = w.pos + 1;
+            else if (punctAt(w, w.pos, 41)) {
+                w.pos = w.pos + 1;
+                more  = false;
+            } else return failed(w);
+        }
+        let comp = newNode(w, N_COMPOUND, i, -1, -1, i, w.pos - 1);
+        setKids(w, comp, &args);
+        w.prec = 0;
+        return comp;
+    }
+    if (k == QATOM) return leaf(w, i);
+    if (k == ATOM) {
+        let next = i + 1;
+        let has_next = next < codeLen(w);
+        if (textAt(w, i, "-") and kindAt(w, next) == NUM and not wsBefore(w, next)) {
+            w.pos  = i + 2;
+            w.prec = 0;
+            return newNode(w, N_NEG, i, i + 1, -1, i, i + 1);
+        }
+        let d = lookupOp(w, PREFIX_OP, i);
+        if (d >= 0) {
+            var as_atom = false;
+            if (not has_next) as_atom = true;
+            else if (isTermEnd(w, next)) as_atom = true;
+            else if (kindAt(w, next) == ATOM and infixOf(w, next, arg) >= 0 and lookupOp(w, PREFIX_OP, next) < 0
+                    and not (punctAt(w, i + 2, 40) and not wsBefore(w, i + 2))) as_atom = true;
+            if (not as_atom) {
+                var p = w.ops.prec(d);
+                if (p > max) p = max;
+                var amax = p - 1;
+                if (w.ops.assoc(d) == FY) amax = p;
+                if (amax < 0) amax = 0;
+                w.pos = i + 1;
+                let operand = parseExpr(w, amax, arg);
+                if (w.fail) return -1;
+                w.prec = p;
+                return newNode(w, N_PREFIX, i, operand, -1, i, endOf(w, operand));
+            }
+        }
+        return leaf(w, i);
+    }
+    if (punctAt(w, i, 40)) {
+        w.pos = i + 1;
+        let inner = parseExpr(w, 1200, false);
+        if (w.fail) return -1;
+        let close = tryPunct(w, 41);
+        if (close < 0) return failed(w);
+        w.prec = 0;
+        return newNode(w, N_PAREN, inner, -1, -1, i, close);
+    }
+    if (punctAt(w, i, 91)) {
+        w.pos = i + 1;
+        let empty = tryPunct(w, 93);
+        if (empty >= 0) {
+            w.prec = 0;
+            return newNode(w, N_EMPTY, i, empty, -1, i, empty);
+        }
+        var items: List[i64];
+        var tail: i64 = -1;
+        var again = true;
+        while (again) {
+            let it = parseExpr(w, 1200, true);
+            if (w.fail) return -1;
+            items.push(it);
+            if (kindAt(w, w.pos) == COMMA) w.pos = w.pos + 1;
+            else if (kindAt(w, w.pos) == BAR) {
+                w.pos = w.pos + 1;
+                tail  = parseExpr(w, 1200, true);
+                if (w.fail) return -1;
+                again = false;
+            } else again = false;
+        }
+        let lclose = tryPunct(w, 93);
+        if (lclose < 0) return failed(w);
+        let lst = newNode(w, N_LIST, -1, tail, -1, i, lclose);
+        setKids(w, lst, &items);
+        w.prec = 0;
+        return lst;
+    }
+    if (punctAt(w, i, 123)) {
+        w.pos = i + 1;
+        let cempty = tryPunct(w, 125);
+        if (cempty >= 0) {
+            w.prec = 0;
+            return newNode(w, N_EMPTY, i, cempty, -1, i, cempty);
+        }
+        let cinner = parseExpr(w, 1200, false);
+        if (w.fail) return -1;
+        let cclose = tryPunct(w, 125);
+        if (cclose < 0) return failed(w);
+        w.prec = 0;
+        return newNode(w, N_CURLY, cinner, -1, -1, i, cclose);
+    }
+    return failed(w);
+}

@@ -1,0 +1,319 @@
+#{
+    Tolerant Prolog tokenizer. It never fails: anything it cannot make sense of becomes an `ERROR`
+    token, which makes the enclosing clause be emitted verbatim.
+#}
+import core.containers.*;
+import prolog_fmt.unicode.*;
+
+# Token kinds.
+const ATOM: i64 = 0;
+const QATOM: i64 = 1;
+const VAR: i64 = 2;
+const NUM: i64 = 3;
+const STR: i64 = 4;
+const BACKQ: i64 = 5;
+# One of `( ) [ ] { }`.
+const PUNCT: i64 = 6;
+const COMMA: i64 = 7;
+const BAR: i64 = 8;
+# Clause terminator: `.` followed by layout, `%` or end of input.
+const END: i64 = 9;
+const LCOMMENT: i64 = 10;
+const BCOMMENT: i64 = 11;
+const ERROR: i64 = 12;
+
+#{
+    A token is a byte range of the string it was lexed from.
+#}
+class Tok {
+    kind: i64 = 0;
+    start: i64 = 0;
+    end: i64 = 0;
+    # 0-based lines of the first and the last character.
+    line: i64 = 0;
+    end_line: i64 = 0;
+    # Whitespace directly precedes this token.
+    ws_before: bool = false;
+    # Newlines in the whitespace directly preceding this token.
+    nl_before: i64 = 0;
+}
+
+fun isCommentKind(k: i64) -> bool = k == LCOMMENT or k == BCOMMENT;
+
+fun isComment(t: ref Tok) -> bool = isCommentKind(t.kind);
+
+#{
+    Whether `t` is the punctuation character with code `c`.
+#}
+fun isPunctCh(s: ref String, t: ref Tok, c: i64) -> bool = t.kind == PUNCT and byteAt(s, t.start) == c;
+
+fun tokIs(s: ref String, t: ref Tok, lit: str) -> bool = rangeIs(s, t.start, t.end, lit);
+
+class Lexer {
+    pos: i64 = 0;
+    line: i64 = 0;
+    n: i64 = 0;
+
+    fun peek(s: ref String) -> i64 = {
+        if (pos >= n) return -1;
+        return cpAt(s, pos);
+    }
+
+    fun peekAt(s: ref String, k: i64) -> i64 = {
+        var p = pos;
+        var i: i64 = 0;
+        while (i < k) {
+            if (p >= n) return -1;
+            p = p + cpLenAt(s, p);
+            i = i + 1;
+        }
+        if (p >= n) return -1;
+        return cpAt(s, p);
+    }
+
+    fun bump(s: ref String) -> i64 = {
+        if (pos >= n) return -1;
+        let c = cpAt(s, pos);
+        pos = pos + cpLenAt(s, pos);
+        if (c == 10) line = line + 1;
+        return c;
+    }
+
+    #{
+        True when the character `k` positions ahead ends a clause (layout, `%` or end of input).
+    #}
+    fun endFollows(s: ref String, k: i64) -> bool = {
+        let c = peekAt(s, k);
+        return c < 0 or isWs(c) or c == 37;
+    }
+
+    fun eatWord(s: ref String) -> () = {
+        while (pos < n and isWordChar(peek(s))) bump(s);
+    }
+
+    fun eatSymbols(s: ref String) -> () = {
+        while (pos < n and isSymbolChar(peek(s))) bump(s);
+    }
+
+    fun eatOct(s: ref String) -> () = {
+        while (pos < n and isOctDigit(peek(s))) bump(s);
+    }
+
+    fun eatHex(s: ref String) -> () = {
+        while (pos < n and isHexDigit(peek(s))) bump(s);
+    }
+
+    #{
+        Consumes a quoted item starting at the opening quote. Returns false when the item is
+        unterminated, in that case it stops before the newline.
+    #}
+    fun quoted(s: ref String, q: i64) -> bool = {
+        bump(s);
+        while (true) {
+            let c = peek(s);
+            if (c < 0 or c == 10) return false;
+            if (c == q) {
+                bump(s);
+                if (peek(s) != q) return true;
+                bump(s);
+            } else if (c == 92) {
+                # Escaped character, including an escaped newline (line continuation).
+                bump(s);
+                if (peek(s) >= 0) bump(s);
+            } else {
+                bump(s);
+            }
+        }
+        return false;
+    }
+
+    #{
+        Digits with SWI-Prolog style `_` digit groups (`1_000_000`).
+    #}
+    fun digits(s: ref String) -> () = {
+        var going = true;
+        while (going) {
+            while (pos < n and isAsciiDigit(peek(s))) bump(s);
+            if (peek(s) == 95 and isAsciiDigit(peekAt(s, 1))) bump(s);
+            else going = false;
+        }
+    }
+
+    fun number(s: ref String) -> () = {
+        let first = bump(s);
+        if (first == 48) {
+            let c = peek(s);
+            if (c == 39) {
+                # Character code literal 0'c.
+                bump(s);
+                let d = peek(s);
+                if (d == 92) {
+                    bump(s);
+                    let e = peek(s);
+                    if (e == 120) {
+                        bump(s);
+                        eatHex(s);
+                        if (peek(s) == 92) bump(s);
+                    } else if (isOctDigit(e)) {
+                        eatOct(s);
+                        if (peek(s) == 92) bump(s);
+                    } else if (e >= 0) {
+                        bump(s);
+                    }
+                } else if (d == 39) {
+                    bump(s);
+                    if (peek(s) == 39) bump(s);
+                } else if (d >= 0) {
+                    bump(s);
+                }
+                return;
+            }
+            if (c == 120 and isHexDigit(peekAt(s, 1))) {
+                bump(s);
+                eatHex(s);
+                return;
+            }
+            if (c == 111 and isOctDigit(peekAt(s, 1))) {
+                bump(s);
+                eatOct(s);
+                return;
+            }
+            if (c == 98 and (peekAt(s, 1) == 48 or peekAt(s, 1) == 49)) {
+                bump(s);
+                while (peek(s) == 48 or peek(s) == 49) bump(s);
+                return;
+            }
+        }
+        digits(s);
+        if (peek(s) == 46 and isAsciiDigit(peekAt(s, 1))) {
+            bump(s);
+            digits(s);
+        }
+        let ex = peek(s);
+        if (ex == 101 or ex == 69) {
+            let x = peekAt(s, 1);
+            var ok = isAsciiDigit(x);
+            if ((x == 43 or x == 45) and isAsciiDigit(peekAt(s, 2))) ok = true;
+            if (ok) {
+                bump(s);
+                if (peek(s) == 43 or peek(s) == 45) bump(s);
+                digits(s);
+            }
+        }
+    }
+
+    #{
+        Consumes one token starting with `c` and returns its kind.
+    #}
+    fun token(s: ref String, c: i64) -> i64 = {
+        if (c == 37) {
+            while (pos < n and peek(s) != 10) bump(s);
+            return LCOMMENT;
+        }
+        if (c == 47 and peekAt(s, 1) == 42) {
+            bump(s);
+            bump(s);
+            var closed = false;
+            var done = false;
+            while (not done) {
+                let x = bump(s);
+                if (x < 0) done = true;
+                else if (x == 42 and peek(s) == 47) {
+                    bump(s);
+                    closed = true;
+                    done = true;
+                }
+            }
+            if (closed) return BCOMMENT;
+            return ERROR;
+        }
+        if (isAsciiDigit(c)) {
+            number(s);
+            return NUM;
+        }
+        if (c == 95 or isUpper(c)) {
+            eatWord(s);
+            return VAR;
+        }
+        if (isAlpha(c)) {
+            eatWord(s);
+            return ATOM;
+        }
+        if (c == 39) return if quoted(s, 39) then QATOM else ERROR;
+        if (c == 34) return if quoted(s, 34) then STR else ERROR;
+        if (c == 96) return if quoted(s, 96) then BACKQ else ERROR;
+        if (c == 40 or c == 41 or c == 91 or c == 93 or c == 123 or c == 125) {
+            bump(s);
+            return PUNCT;
+        }
+        if (c == 44) {
+            bump(s);
+            return COMMA;
+        }
+        if (c == 124) {
+            bump(s);
+            if (peek(s) == 124) {
+                bump(s);
+                return ATOM;
+            }
+            return BAR;
+        }
+        if (c == 33 or c == 59) {
+            bump(s);
+            return ATOM;
+        }
+        if (isSymbolChar(c)) {
+            if (c == 46 and endFollows(s, 1)) {
+                bump(s);
+                return END;
+            }
+            eatSymbols(s);
+            return ATOM;
+        }
+        bump(s);
+        return ERROR;
+    }
+}
+
+fun countNewlines(s: ref String, a: i64, b: i64) -> i64 = {
+    var k: i64 = 0;
+    var i = a;
+    while (i < b) {
+        if (byteAt(s, i) == 10) k = k + 1;
+        i = i + 1;
+    }
+    return k;
+}
+
+#{
+    Appends the tokens of `s` to `toks`.
+#}
+fun lex(s: ref String, toks: ref List[Tok]) -> () = {
+    var lx: Lexer;
+    lx.n = s.length();
+    let first = toks.length();
+    var going = true;
+    while (going) {
+        let ws_start = lx.pos;
+        var nl: i64 = 0;
+        var c = lx.peek(s);
+        while (c >= 0 and isWs(c)) {
+            if (c == 10) nl = nl + 1;
+            lx.bump(s);
+            c = lx.peek(s);
+        }
+        if (c < 0) going = false;
+        else {
+            var t: Tok;
+            t.ws_before = lx.pos > ws_start or toks.length() == first;
+            t.nl_before = nl;
+            t.start = lx.pos;
+            t.line = lx.line;
+            t.kind = lx.token(s, c);
+            t.end = lx.pos;
+            if (t.kind == ATOM and t.start == t.end) t.kind = ERROR;
+            t.end_line = t.line + countNewlines(s, t.start, t.end);
+            toks.push(t);
+        }
+    }
+}

@@ -1,0 +1,204 @@
+#{
+    UTF-8 decoding and character classification.
+
+    The Rust version relies on the Unicode tables of `char`. Here the tables cover ASCII, Latin-1,
+    Latin Extended-A/B (all Polish letters), IPA, Greek and Cyrillic exactly enough for Prolog
+    tokens. Other code points are treated as lowercase letters unless they fall into the common
+    punctuation, symbol or emoji blocks.
+#}
+import core.containers.*;
+
+fun byteAt(s: ref String, i: i64) -> i64 = {
+    let c: char = s.at(i);
+    return c as i64;
+}
+
+fun isCont(b: i64) -> bool = b >= 128 and b < 192;
+
+#{
+    Length in bytes of the code point starting with byte `b0`.
+#}
+fun cpLen(b0: i64) -> i64 = {
+    if (b0 >= 240) return 4;
+    if (b0 >= 224) return 3;
+    if (b0 >= 192) return 2;
+    return 1;
+}
+
+#{
+    Code point starting at byte `i`. Truncated or malformed sequences decode to the lead byte.
+#}
+fun cpAt(s: ref String, i: i64) -> i64 = {
+    let b0 = byteAt(s, i);
+    let len = cpLen(b0);
+    if (len == 1) return b0;
+    if (i + len > s.length()) return b0;
+    var cp: i64 = 0;
+    if (len == 2) cp = b0 - 192;
+    else if (len == 3) cp = b0 - 224;
+    else cp = b0 - 240;
+    var k: i64 = 1;
+    while (k < len) {
+        let b = byteAt(s, i + k);
+        if (not isCont(b)) return b0;
+        cp = cp * 64 + (b - 128);
+        k = k + 1;
+    }
+    return cp;
+}
+
+#{
+    Byte length of the code point at `i`, never running past the end of `s`.
+#}
+fun cpLenAt(s: ref String, i: i64) -> i64 = {
+    let len = cpLen(byteAt(s, i));
+    if (len == 1 or i + len > s.length()) return 1;
+    var k: i64 = 1;
+    while (k < len) {
+        if (not isCont(byteAt(s, i + k))) return 1;
+        k = k + 1;
+    }
+    return len;
+}
+
+#{
+    Start of the code point that ends right before byte `i` (and starts at or after `lo`).
+#}
+fun prevCpStart(s: ref String, lo: i64, i: i64) -> i64 = {
+    var p = i - 1;
+    while (p > lo and isCont(byteAt(s, p)) and i - p < 4) p = p - 1;
+    return p;
+}
+
+#{
+    First code point of `s[a..b]`, or -1 when the range is empty.
+#}
+fun firstCp(s: ref String, a: i64, b: i64) -> i64 = {
+    if (a >= b) return -1;
+    return cpAt(s, a);
+}
+
+fun lastCp(s: ref String, a: i64, b: i64) -> i64 = {
+    if (a >= b) return -1;
+    return cpAt(s, prevCpStart(s, a, b));
+}
+
+#{
+    Number of code points in `s[a..b]`.
+#}
+fun cpCount(s: ref String, a: i64, b: i64) -> i64 = {
+    var n: i64 = 0;
+    var i = a;
+    while (i < b) {
+        if (not isCont(byteAt(s, i))) n = n + 1;
+        i = i + 1;
+    }
+    return n;
+}
+
+fun isWs(c: i64) -> bool = {
+    if (c == 32 or (c >= 9 and c <= 13)) return true;
+    if (c < 128) return false;
+    return c == 133 or c == 160 or c == 5760 or (c >= 8192 and c <= 8202) or c == 8232 or c == 8233
+        or c == 8239 or c == 8287 or c == 12288;
+}
+
+fun isAsciiDigit(c: i64) -> bool = c >= 48 and c <= 57;
+
+fun isOctDigit(c: i64) -> bool = c >= 48 and c <= 55;
+
+fun isHexDigit(c: i64) -> bool = isAsciiDigit(c) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70);
+
+fun isUpper(c: i64) -> bool = {
+    if (c >= 65 and c <= 90) return true;
+    if (c < 192) return false;
+    if (c <= 222) return c != 215;
+    if (c < 256) return false;
+    if (c <= 311) return c % 2 == 0;
+    if (c == 312) return false;
+    if (c <= 328) return c % 2 == 1;
+    if (c == 329) return false;
+    if (c <= 375) return c % 2 == 0;
+    if (c == 376) return true;
+    if (c <= 382) return c % 2 == 1;
+    if (c >= 913 and c <= 937) return c != 930;
+    if (c >= 1024 and c <= 1071) return true;
+    if (c >= 1120 and c <= 1279) return c % 2 == 0;
+    return false;
+}
+
+fun isAlpha(c: i64) -> bool = {
+    if ((c >= 97 and c <= 122) or (c >= 65 and c <= 90)) return true;
+    if (c < 128) return false;
+    if (c == 170 or c == 181 or c == 186) return true;
+    if (c < 192) return false;
+    if (c == 215 or c == 247) return false;
+    if (c <= 687) return true;
+    if (c < 880) return false;
+    if (c <= 1327) return true;
+    if (c >= 8192 and c <= 11263) return false;
+    if (c >= 12288 and c <= 12351) return false;
+    if (c >= 65024 and c <= 65039) return false;
+    if (c >= 126976) return false;
+    return true;
+}
+
+fun isNumericExtra(c: i64) -> bool = c == 178 or c == 179 or c == 185 or c == 188 or c == 189 or c == 190;
+
+fun isWordChar(c: i64) -> bool = c == 95 or isAsciiDigit(c) or isAlpha(c) or isNumericExtra(c);
+
+#{
+    One of `+-*/\^<>=~:.?@#&$`.
+#}
+fun isSymbolChar(c: i64) -> bool = {
+    return c == 43 or c == 45 or c == 42 or c == 47 or c == 92 or c == 94 or c == 60 or c == 62
+        or c == 61 or c == 126 or c == 58 or c == 46 or c == 63 or c == 64 or c == 35 or c == 38
+        or c == 36;
+}
+
+#{
+    End of `s[a..b]` with trailing whitespace removed.
+#}
+fun trimEndPos(s: ref String, a: i64, b: i64) -> i64 = {
+    var e = b;
+    var going = true;
+    while (going and e > a) {
+        let p = prevCpStart(s, a, e);
+        if (isWs(cpAt(s, p))) e = p;
+        else going = false;
+    }
+    return e;
+}
+
+#{
+    Whether `s[a..b]` spells exactly `lit`.
+#}
+fun rangeIs(s: ref String, a: i64, b: i64, lit: str) -> bool = {
+    if (b - a != lit.length()) return false;
+    var i: i64 = 0;
+    while (i < lit.length()) {
+        let c: char = s.at(a + i);
+        if (c != lit[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+fun rangesEqual(s: ref String, a: i64, b: i64, t: ref String, c: i64, d: i64) -> bool = {
+    if (b - a != d - c) return false;
+    var i: i64 = 0;
+    while (i < b - a) {
+        if (byteAt(s, a + i) != byteAt(t, c + i)) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+fun appendRange(dst: ref String, s: ref String, a: i64, b: i64) -> () = {
+    var i = a;
+    while (i < b) {
+        let c: char = s.at(i);
+        dst.append(c);
+        i = i + 1;
+    }
+}

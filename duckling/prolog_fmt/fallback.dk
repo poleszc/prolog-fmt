@@ -1,0 +1,79 @@
+#{
+    Token-level formatter for clauses that do not parse (or whose comments the layout printer
+    cannot place). It keeps the original line breaks, re-indents each line from bracket depth
+    and normalises spacing within lines.
+#}
+import core.containers.*;
+import prolog_fmt.unicode.*;
+import prolog_fmt.lexer.*;
+import prolog_fmt.out.*;
+import prolog_fmt.world.*;
+
+fun isOpenTok(s: ref String, t: ref Tok) -> bool = isPunctCh(s, t, 40) or isPunctCh(s, t, 91) or isPunctCh(s, t, 123);
+
+fun isCloseTok(s: ref String, t: ref Tok) -> bool = isPunctCh(s, t, 41) or isPunctCh(s, t, 93) or isPunctCh(s, t, 125);
+
+fun isLeadOp(s: ref String, t: ref Tok) -> bool = {
+    if (t.kind == BAR) return true;
+    return t.kind == ATOM and (tokIs(s, t, ";") or tokIs(s, t, "->") or tokIs(s, t, "*->"));
+}
+
+#{
+    Formats the tokens `w.toks[s..e]` into `w.outs[0]`.
+#}
+fun fallbackFormat(w: ref World, s: i64, e: i64) -> () = {
+    w.outs.at(0).reset();
+    # Opening brackets (their character codes) enclosing the current token.
+    var stack: List[i64];
+    var neck = false;
+    # Indentation of the current line and whether its first token was an opening bracket or a
+    # leading control operator (SWI-style padding).
+    var line_ind: i64 = 0;
+    var pad_after_first = false;
+    var k = s;
+    while (k < e) {
+        let t: Tok = w.toks.at(k);
+        var top: i64 = -1;
+        if (stack.length() > 0) top = stack.at(stack.length() - 1);
+        let line_start = k == s or t.nl_before > 0;
+        if (line_start) {
+            if (k > s) {
+                var d = stack.length();
+                if (isCloseTok(&w.src, &t) or (isLeadOp(&w.src, &t) and top == 40)) {
+                    d = d - 1;
+                    if (d < 0) d = 0;
+                }
+                line_ind = INDENT * d;
+                if (neck) line_ind = line_ind + INDENT;
+                if (t.nl_before >= 2) w.outs.at(0).nl(0);
+                w.outs.at(0).nl(line_ind);
+            }
+            pad_after_first = isLeadOp(&w.src, &t) and top == 40;
+            if (isOpenTok(&w.src, &t) and k + 1 < e) {
+                let nx: Tok = w.toks.at(k + 1);
+                if (nx.ws_before and nx.nl_before == 0) pad_after_first = true;
+            }
+        } else {
+            let p: Tok = w.toks.at(k - 1);
+            let first_on_line = k == s + 1 or p.nl_before > 0;
+            if (first_on_line and pad_after_first) w.outs.at(0).padTo(line_ind + INDENT);
+            else if (isComment(&t)) w.outs.at(0).sp();
+            else if (t.kind == COMMA or t.kind == END or isCloseTok(&w.src, &t)) {
+                # No space.
+            } else if (p.kind == COMMA or t.kind == BAR or p.kind == BAR) w.outs.at(0).sp();
+            else if (isOpenTok(&w.src, &p)) {
+                # No space.
+            } else if (t.ws_before) w.outs.at(0).sp();
+        }
+        if (isComment(&t)) w.outs.at(0).comment(&w.src, &t);
+        else if (isPunctCh(&w.src, &t, 40) and not t.ws_before) w.outs.at(0).tokTight(&w.src, &t);
+        else w.outs.at(0).tok(&w.src, &t);
+        if (isOpenTok(&w.src, &t)) stack.push(byteAt(&w.src, t.start));
+        else if (isCloseTok(&w.src, &t) and stack.length() > 0) stack.pop();
+        if (stack.length() == 0 and t.kind == ATOM
+                and (tokIs(&w.src, &t, ":-") or tokIs(&w.src, &t, "-->") or tokIs(&w.src, &t, "=>")
+                    or tokIs(&w.src, &t, "?-"))) neck = true;
+        k = k + 1;
+    }
+    w.outs.at(0).finish();
+}

@@ -1,0 +1,195 @@
+#{
+    Operator table (SWI-Prolog defaults plus common library operators).
+#}
+import core.containers.*;
+import prolog_fmt.unicode.*;
+
+const XFX: i64 = 0;
+const XFY: i64 = 1;
+const YFX: i64 = 2;
+const FY: i64 = 3;
+const FX: i64 = 4;
+const XF: i64 = 5;
+const YF: i64 = 6;
+
+# Operator classes.
+const PREFIX_OP: i64 = 0;
+const INFIX_OP: i64 = 1;
+const POSTFIX_OP: i64 = 2;
+
+fun assocClass(a: i64) -> i64 = {
+    if (a <= YFX) return INFIX_OP;
+    if (a <= FX) return PREFIX_OP;
+    return POSTFIX_OP;
+}
+
+#{
+    Parses `xfx`, `fy`, ... from `s[a..b]`, -1 when it is not an operator type.
+#}
+fun parseAssoc(s: ref String, a: i64, b: i64) -> i64 = {
+    if (rangeIs(s, a, b, "xfx")) return XFX;
+    if (rangeIs(s, a, b, "xfy")) return XFY;
+    if (rangeIs(s, a, b, "yfx")) return YFX;
+    if (rangeIs(s, a, b, "fy")) return FY;
+    if (rangeIs(s, a, b, "fx")) return FX;
+    if (rangeIs(s, a, b, "xf")) return XF;
+    if (rangeIs(s, a, b, "yf")) return YF;
+    return -1;
+}
+
+#{
+    An operator name lives in `OpTable.pool[start..end]`. A priority of 0 means removed.
+#}
+class OpDef {
+    start: i64 = 0;
+    end: i64 = 0;
+    cls: i64 = 0;
+    prec: i64 = 0;
+    assoc: i64 = 0;
+}
+
+class OpTable {
+    pool: String;
+    defs: List[OpDef];
+
+    #{
+        Index of the operator of class `cls` named `s[a..b]`, or -1.
+    #}
+    fun find(cls: i64, s: ref String, a: i64, b: i64) -> i64 = {
+        var i: i64 = 0;
+        while (i < defs.length()) {
+            let d: OpDef = defs.at(i);
+            if (d.cls == cls and rangesEqual(&pool, d.start, d.end, s, a, b)) return i;
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    #{
+        Like `find`, but skips removed operators.
+    #}
+    fun lookup(cls: i64, s: ref String, a: i64, b: i64) -> i64 = {
+        let i = find(cls, s, a, b);
+        if (i < 0) return -1;
+        if (defs.at(i).prec == 0) return -1;
+        return i;
+    }
+
+    fun prec(i: i64) -> i64 = defs.at(i).prec;
+
+    fun assoc(i: i64) -> i64 = defs.at(i).assoc;
+
+    #{
+        Adds (or with priority 0 removes) an operator, as `op/3` does.
+    #}
+    fun add(p: i64, a: i64, s: ref String, start: i64, end: i64) -> () = {
+        let cls = assocClass(a);
+        var pr = p;
+        if (pr > 1200) pr = 1200;
+        let i = find(cls, s, start, end);
+        if (i >= 0) {
+            defs.at(i).prec  = pr;
+            defs.at(i).assoc = a;
+        } else if (pr != 0) {
+            var d: OpDef;
+            d.start = pool.length();
+            appendRange(&pool, s, start, end);
+            d.end   = pool.length();
+            d.cls   = cls;
+            d.prec  = pr;
+            d.assoc = a;
+            defs.push(d);
+        }
+    }
+
+    fun addStr(p: i64, a: i64, name: str) -> () = {
+        var tmp: String;
+        tmp.append(name);
+        add(p, a, &tmp, 0, tmp.length());
+    }
+
+    fun addDefaults() -> () = {
+        addStr(1200, XFX, ":-");
+        addStr(1200, XFX, "-->");
+        addStr(1200, XFX, "=>");
+        addStr(1200, FX, ":-");
+        addStr(1200, FX, "?-");
+        addStr(1100, XFY, ";");
+        addStr(1100, XFY, "|");
+        addStr(1105, XFY, "|");
+        addStr(1050, XFY, "->");
+        addStr(1050, XFY, "*->");
+        addStr(1000, XFY, ",");
+        addStr(990, XFX, ":=");
+        addStr(900, FY, "\\+");
+        addStr(700, XFX, "=");
+        addStr(700, XFX, "\\=");
+        addStr(700, XFX, "==");
+        addStr(700, XFX, "\\==");
+        addStr(700, XFX, "@<");
+        addStr(700, XFX, "@>");
+        addStr(700, XFX, "@=<");
+        addStr(700, XFX, "@>=");
+        addStr(700, XFX, "=..");
+        addStr(700, XFX, "is");
+        addStr(700, XFX, "=:=");
+        addStr(700, XFX, "=\\=");
+        addStr(700, XFX, "<");
+        addStr(700, XFX, ">");
+        addStr(700, XFX, "=<");
+        addStr(700, XFX, ">=");
+        addStr(700, XFX, ">:<");
+        addStr(700, XFX, ":<");
+        addStr(700, XFX, "as");
+        addStr(600, XFY, ":");
+        addStr(500, YFX, "+");
+        addStr(500, YFX, "-");
+        addStr(500, YFX, "/\\");
+        addStr(500, YFX, "\\/");
+        addStr(500, YFX, "xor");
+        addStr(500, FX, "?");
+        addStr(400, YFX, "*");
+        addStr(400, YFX, "/");
+        addStr(400, YFX, "//");
+        addStr(400, YFX, "rdiv");
+        addStr(400, YFX, "<<");
+        addStr(400, YFX, ">>");
+        addStr(400, YFX, "mod");
+        addStr(400, YFX, "rem");
+        addStr(400, YFX, "div");
+        addStr(400, YFX, "divmod");
+        addStr(200, XFX, "**");
+        addStr(200, XFY, "^");
+        addStr(200, FY, "-");
+        addStr(200, FY, "+");
+        addStr(200, FY, "\\");
+        addStr(100, YFX, ".");
+        addStr(1, FX, "$");
+        addStr(1150, FX, "dynamic");
+        addStr(1150, FX, "discontiguous");
+        addStr(1150, FX, "initialization");
+        addStr(1150, FX, "meta_predicate");
+        addStr(1150, FX, "module_transparent");
+        addStr(1150, FX, "multifile");
+        addStr(1150, FX, "public");
+        addStr(1150, FX, "thread_local");
+        addStr(1150, FX, "table");
+        # library(clpfd)
+        addStr(760, YFX, "#<==>");
+        addStr(750, XFY, "#==>");
+        addStr(750, YFX, "#<==");
+        addStr(740, YFX, "#\\/");
+        addStr(730, YFX, "#\\");
+        addStr(720, YFX, "#/\\");
+        addStr(710, FY, "#\\");
+        addStr(700, XFX, "#>");
+        addStr(700, XFX, "#<");
+        addStr(700, XFX, "#>=");
+        addStr(700, XFX, "#=<");
+        addStr(700, XFX, "#=");
+        addStr(700, XFX, "#\\=");
+        addStr(700, XFX, "in");
+        addStr(700, XFX, "ins");
+        addStr(450, XFX, "..");
+    }
+}

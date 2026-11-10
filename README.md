@@ -73,6 +73,31 @@ extension, in `settings.json`:
 Format with **Format Document** (Ctrl+Shift+I on Linux). For a different
 width use `"command": "~/.cargo/bin/prolog-fmt --width 100"`.
 
+## Duckling port
+
+`duckling/prolog_fmt/` is a port of the formatter to Duckling with identical
+output. It reads standard input and writes standard output (Duckling programs
+have no command-line arguments, so the width is fixed at 120 and there is no
+`--write`/`--check`/`--verbose`).
+
+```sh
+duckling/build.sh                       # builds duckling/build/prolog-fmt
+duckling/build/prolog-fmt < in.pl > out.pl
+duckling/test.sh                        # differential test against the Rust build
+```
+
+`build.sh` uses the compiler at `$DUCKC`, by default
+`~/ducktype/copy-duckling/dev/build/bin/duckc`.
+
+The modules mirror the Rust ones: `unicode` (UTF-8 decoding and character
+classes), `lexer`, `ops`, `out`, `world` (shared state and the parse-tree
+arena), `parser`, `printer`, `fallback` and `prolog_fmt` (clause splitting,
+verification, `main`). The only intended difference is the Unicode tables: the
+Duckling version classifies Latin, Greek and Cyrillic letters exactly and treats
+other non-ASCII characters as lowercase letters unless they are in the common
+punctuation, symbol or emoji blocks. A panic in the Duckling version aborts the
+program instead of leaving the clause verbatim (Duckling cannot catch panics).
+
 ## Tests
 
 ```sh

@@ -1,0 +1,75 @@
+#{
+    State shared by the parser and the printers.
+
+    The parse tree of a clause is a flat arena: nodes refer to each other and to the clause's
+    code tokens by index.
+#}
+import core.containers.*;
+import prolog_fmt.lexer.*;
+import prolog_fmt.ops.*;
+import prolog_fmt.out.*;
+
+# Node types and the meaning of their fields.
+# Atom, variable, number or string: `a` is the token.
+const N_LEAF: i64 = 0;
+# `-` immediately followed by a number: tokens `a` and `b`.
+const N_NEG: i64 = 1;
+# `[]` or `{}` written as two tokens `a` and `b`.
+const N_EMPTY: i64 = 2;
+# `a` is the name token, the arguments are the kids.
+const N_COMPOUND: i64 = 3;
+# The elements are the kids, `b` is the tail node or -1.
+const N_LIST: i64 = 4;
+# `a` is the inner node.
+const N_CURLY: i64 = 5;
+const N_PAREN: i64 = 6;
+# `a` is the operator token, `b` the left and `c` the right operand.
+const N_INFIX: i64 = 7;
+# `a` is the operator token, `b` the operand.
+const N_PREFIX: i64 = 8;
+const N_POSTFIX: i64 = 9;
+
+class Node {
+    t: i64 = 0;
+    a: i64 = 0;
+    b: i64 = 0;
+    c: i64 = 0;
+    # First and last code token (inclusive).
+    start: i64 = 0;
+    end: i64 = 0;
+    # Children are `World.kids[koff .. koff + klen]`.
+    koff: i64 = 0;
+    klen: i64 = 0;
+}
+
+class Comment {
+    tok: Tok;
+    # Index of the code token that follows the comment.
+    gap: i64 = 0;
+    # The comment starts on the line where the previous code token ends.
+    same_line: bool = false;
+}
+
+const INDENT: i64 = 4;
+
+class World {
+    src: String;
+    toks: List[Tok];
+    ops: OpTable;
+    width: i64 = 120;
+
+    # The clause being formatted.
+    code: List[Tok];
+    comments: List[Comment];
+    used: List[bool];
+    nodes: List[Node];
+    kids: List[i64];
+
+    # Parser state.
+    pos: i64 = 0;
+    fail: bool = false;
+    prec: i64 = 0;
+
+    # `outs[0]` receives the output, `outs[1]` is used to measure flat layouts.
+    outs: List[Out];
+}

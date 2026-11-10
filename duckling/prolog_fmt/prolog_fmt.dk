@@ -1,0 +1,334 @@
+#{
+    Prolog source formatter, a Duckling port of the Rust `prolog-fmt`.
+
+    Reads a Prolog file on standard input and writes the formatted file to standard output, with
+    a maximum line width of 120.
+
+    The file is split into clauses at end tokens and each clause is formatted on its own, so a
+    broken clause never affects the rest of the file. For every clause the formatter tries, in
+    order:
+
+    1. full layout from a parse tree (`printer`),
+    2. token-level re-indentation (`fallback`) if the clause does not parse,
+    3. the original text, verbatim.
+
+    The output of steps 1 and 2 is re-tokenized and compared with the input. Anything other than
+    a whitespace change is rejected and the next step is used instead.
+#}
+import core.containers.*;
+import core.primitive_io as io;
+import prolog_fmt.unicode.*;
+import prolog_fmt.lexer.*;
+import prolog_fmt.ops.*;
+import prolog_fmt.out.*;
+import prolog_fmt.world.*;
+import prolog_fmt.parser.*;
+import prolog_fmt.printer.*;
+import prolog_fmt.fallback.*;
+
+# How a clause was handled.
+const FORMATTED: i64 = 0;
+# The clause did not parse, token-level formatting was used.
+const UNPARSED: i64 = 1;
+# Parsed, but comments or layout forced token-level formatting.
+const TOKEN_LAYOUT: i64 = 2;
+# Left exactly as written.
+const VERBATIM: i64 = 3;
+
+# ------------------------------------------------------------- verification ---
+
+#{
+    Index of the first non-comment (`code`) or comment token at or after `i`, or `e`.
+#}
+fun skipTo(toks: ref List[Tok], i: i64, e: i64, code: bool) -> i64 = {
+    var j = i;
+    while (j < e and isCommentKind(toks.at(j).kind) == code) j = j + 1;
+    return j;
+}
+
+#{
+    Do `w.toks[s..e]` (from `w.src`) and `nts` (from `text`) have equal code tokens and equal
+    comments (ignoring trailing whitespace)?
+#}
+fun sameTokens(w: ref World, s: i64, e: i64, text: ref String, nts: ref List[Tok], code: bool) -> bool = {
+    var i = skipTo(&w.toks, s, e, code);
+    var j = skipTo(nts, 0, nts.length(), code);
+    while (i < e and j < nts.length()) {
+        let a: Tok = w.toks.at(i);
+        let b: Tok = nts.at(j);
+        if (code) {
+            if (a.kind != b.kind) return false;
+            if (not rangesEqual(&w.src, a.start, a.end, text, b.start, b.end)) return false;
+        } else {
+            let ae = trimEndPos(&w.src, a.start, a.end);
+            let be = trimEndPos(text, b.start, b.end);
+            if (not rangesEqual(&w.src, a.start, ae, text, b.start, be)) return false;
+        }
+        i = skipTo(&w.toks, i + 1, e, code);
+        j = skipTo(nts, j + 1, nts.length(), code);
+    }
+    return i == e and j == nts.length();
+}
+
+fun verify(w: ref World, s: i64, e: i64, text: ref String) -> bool = {
+    var nts: List[Tok];
+    lex(text, &nts);
+    var i: i64 = 0;
+    while (i < nts.length()) {
+        if (nts.at(i).kind == ERROR) return false;
+        i = i + 1;
+    }
+    return sameTokens(w, s, e, text, &nts, true) and sameTokens(w, s, e, text, &nts, false);
+}
+
+# ------------------------------------------------------------ op directives ---
+
+#{
+    Appends the operator name given by node `n` to `name`. Returns false when `n` is not an
+    atom.
+#}
+fun atomName(w: ref World, n: i64, name: ref String) -> bool = {
+    let t = nt(w, n);
+    if (t == N_LEAF) {
+        let tk: Tok = w.code.at(na(w, n));
+        if (tk.kind == ATOM) {
+            appendRange(name, &w.src, tk.start, tk.end);
+            return true;
+        }
+        if (tk.kind == QATOM) {
+            var i = tk.start + 1;
+            let stop = tk.end - 1;
+            while (i < stop) {
+                let c: char = w.src.at(i);
+                name.append(c);
+                if (c == '\'' and i + 1 < stop and byteAt(&w.src, i + 1) == 39) i = i + 2;
+                else i = i + 1;
+            }
+            return true;
+        }
+        return false;
+    }
+    if (t == N_EMPTY and punctAt(w, na(w, n), 91)) {
+        name.append("[]");
+        return true;
+    }
+    return false;
+}
+
+fun addOpNamed(w: ref World, p: i64, a: i64, n: i64) -> () = {
+    var name: String;
+    if (atomName(w, n, &name)) w.ops.add(p, a, &name, 0, name.length());
+}
+
+#{
+    Handles `:- op(P, T, Names)` so later clauses parse with the new operators.
+#}
+fun applyOpDirective(w: ref World, root: i64) -> () = {
+    if (nt(w, root) != N_PREFIX or not textAt(w, na(w, root), ":-")) return;
+    let call = nb(w, root);
+    if (nt(w, call) != N_COMPOUND or not textAt(w, na(w, call), "op") or nkids(w, call) != 3) return;
+    let pn = kid(w, call, 0);
+    let an = kid(w, call, 1);
+    if (nt(w, pn) != N_LEAF or nt(w, an) != N_LEAF) return;
+    let pt: Tok = w.code.at(na(w, pn));
+    let at: Tok = w.code.at(na(w, an));
+    # Priority: a plain decimal that fits into 16 bits.
+    if (pt.start == pt.end) return;
+    var p: i64 = 0;
+    var i = pt.start;
+    while (i < pt.end) {
+        let d = byteAt(&w.src, i);
+        if (not isAsciiDigit(d)) return;
+        p = p * 10 + (d - 48);
+        if (p > 65535) return;
+        i = i + 1;
+    }
+    let a = parseAssoc(&w.src, at.start, at.end);
+    if (a < 0) return;
+    let names = kid(w, call, 2);
+    if (nt(w, names) == N_LIST) {
+        var k: i64 = 0;
+        while (k < nkids(w, names)) {
+            addOpNamed(w, p, a, kid(w, names, k));
+            k = k + 1;
+        }
+    } else {
+        addOpNamed(w, p, a, names);
+    }
+}
+
+# ------------------------------------------------------------------ clauses ---
+
+fun appendVerbatim(w: ref World, s: i64, e: i64, out: ref String) -> () = {
+    let a = w.toks.at(s).start;
+    appendRange(out, &w.src, a, trimEndPos(&w.src, a, w.toks.at(e - 1).end));
+}
+
+#{
+    Formats the clause `w.toks[s..e]`, appending the text to `out`. Returns the outcome.
+#}
+fun formatOne(w: ref World, s: i64, e: i64, out: ref String) -> i64 = {
+    var k = s;
+    while (k < e) {
+        if (w.toks.at(k).kind == ERROR) {
+            appendVerbatim(w, s, e, out);
+            return VERBATIM;
+        }
+        k = k + 1;
+    }
+    w.code.clear();
+    w.comments.clear();
+    w.used.clear();
+    w.nodes.clear();
+    w.kids.clear();
+    var j = s;
+    while (j < e) {
+        let t: Tok = w.toks.at(j);
+        if (isComment(&t)) {
+            var c: Comment;
+            c.tok       = t;
+            c.gap       = w.code.length();
+            c.same_line = w.code.length() > 0 and w.code.at(w.code.length() - 1).end_line == t.line;
+            w.comments.push(c);
+            w.used.push(false);
+        } else {
+            w.code.push(t);
+        }
+        j = j + 1;
+    }
+    var outcome = UNPARSED;
+    let root = parseClause(w);
+    if (root >= 0) {
+        applyOpDirective(w, root);
+        w.outs.at(0).reset();
+        if (printClause(w, root)) {
+            var text = copy w.outs.at(0).s;
+            if (verify(w, s, e, &text)) {
+                out.append(&text);
+                return FORMATTED;
+            }
+        }
+        outcome = TOKEN_LAYOUT;
+    }
+    fallbackFormat(w, s, e);
+    var ftext = copy w.outs.at(0).s;
+    if (verify(w, s, e, &ftext)) {
+        out.append(&ftext);
+        return outcome;
+    }
+    appendVerbatim(w, s, e, out);
+    return VERBATIM;
+}
+
+#{
+    Positions where a broken clause probably contains the start of another clause: a line
+    starting in column 0 at bracket depth 0 with an atom (a head). Typically caused by a missing
+    `.`.
+#}
+fun recoveryPoints(w: ref World, s: i64, e: i64, points: ref List[i64]) -> () = {
+    var depth: i64 = 0;
+    var k = s;
+    while (k < e) {
+        let t: Tok = w.toks.at(k);
+        if (k > s and depth <= 0 and t.nl_before > 0 and (t.kind == ATOM or t.kind == QATOM)
+                and (t.start == 0 or byteAt(&w.src, t.start - 1) == 10)) points.push(k);
+        if (t.kind == ERROR) {
+            # An unterminated quote may have swallowed closing brackets.
+            depth = 0;
+        } else if (t.kind == PUNCT) {
+            let c = byteAt(&w.src, t.start);
+            if (c == 40 or c == 91 or c == 123) depth = depth + 1;
+            else depth = depth - 1;
+        }
+        k = k + 1;
+    }
+}
+
+fun formatClause(w: ref World, s: i64, e: i64, out: ref String) -> i64 = {
+    var text: String;
+    let outcome = formatOne(w, s, e, &text);
+    if (outcome == FORMATTED) {
+        out.append(&text);
+        return outcome;
+    }
+    var bounds: List[i64];
+    bounds.push(s);
+    recoveryPoints(w, s, e, &bounds);
+    if (bounds.length() == 1) {
+        out.append(&text);
+        return outcome;
+    }
+    bounds.push(e);
+    var worst = FORMATTED;
+    var i: i64 = 0;
+    while (i + 1 < bounds.length()) {
+        let a = bounds.at(i);
+        let b = bounds.at(i + 1);
+        if (a > s) {
+            if (w.toks.at(a).nl_before >= 2) out.append("\n\n");
+            else out.append('\n');
+        }
+        var seg: String;
+        let o = formatOne(w, a, b, &seg);
+        out.append(&seg);
+        if (o != FORMATTED and (worst == FORMATTED or o == VERBATIM)) worst = o;
+        i = i + 1;
+    }
+    # A segment that formatted on its own still means the original clause was broken (it
+    # lacked a terminator).
+    if (worst == FORMATTED) worst = UNPARSED;
+    return worst;
+}
+
+#{
+    Formats `w.src` into `out`.
+#}
+fun formatSource(w: ref World, out: ref String) -> () = {
+    lex(&w.src, &w.toks);
+    w.ops.addDefaults();
+    var main_out: Out;
+    var measure_out: Out;
+    w.outs.push(move main_out);
+    w.outs.push(move measure_out);
+    let n = w.toks.length();
+    var first = true;
+    var i: i64 = 0;
+    while (i < n) {
+        let t: Tok = w.toks.at(i);
+        if (not first) {
+            if (t.nl_before == 0) out.append(' ');
+            else if (t.nl_before == 1) out.append('\n');
+            else out.append("\n\n");
+        }
+        first = false;
+        if (isComment(&t)) {
+            if (t.kind == LCOMMENT) appendRange(out, &w.src, t.start, trimEndPos(&w.src, t.start, t.end));
+            else appendRange(out, &w.src, t.start, t.end);
+            i = i + 1;
+        } else {
+            # A clause runs to its end token, plus the comments on the same line as that token.
+            var e = i;
+            while (e < n and w.toks.at(e).kind != END) e = e + 1;
+            if (e < n) {
+                e = e + 1;
+                while (e < n and isCommentKind(w.toks.at(e).kind) and w.toks.at(e).nl_before == 0) e = e + 1;
+            }
+            formatClause(w, i, e, out);
+            i = e;
+        }
+    }
+    if (out.length() > 0) out.append('\n');
+}
+
+fun main() -> i64 = {
+    var w: World;
+    var c = io.readCharCode();
+    while (c >= 0) {
+        w.src.append(c as char);
+        c = io.readCharCode();
+    }
+    var out: String;
+    formatSource(&w, &out);
+    io.writeString(&out);
+    return 0;
+}
